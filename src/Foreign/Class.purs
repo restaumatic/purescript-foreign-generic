@@ -2,17 +2,25 @@ module Foreign.Class where
 
 import Prelude
 
-import Control.Monad.Except (except, mapExcept)
+import Control.Monad.Except (ExceptT(..), except, mapExcept, runExceptT, withExcept)
 import Data.Array ((..), zipWith, length)
 import Data.Bifunctor (lmap)
 import Data.Either (Either(..))
 import Data.Maybe (Maybe, maybe)
+import Data.Symbol (class IsSymbol, SProxy(..), reflectSymbol)
 import Data.Traversable (sequence)
 import Foreign (F, Foreign, ForeignError(..), readArray, readBoolean, readChar, readInt, readNumber, readString, unsafeToForeign)
+import Foreign.Index (readProp)
 import Foreign.Internal (readObject)
 import Foreign.NullOrUndefined (readNullOrUndefined, undefined)
 import Foreign.Object (Object)
 import Foreign.Object as Object
+import Prim.Row (class Cons, class Lacks) as Row
+import Prim.RowList (class RowToList, Cons, Nil, kind RowList)
+import Record (get)
+import Record.Builder (Builder)
+import Record.Builder (build, insert) as Builder
+import Type.Prelude (RLProxy(..))
 
 -- | The `Decode` class is used to generate decoding functions
 -- | of the form `Foreign -> F a` using `generics-rep` deriving.
@@ -70,6 +78,43 @@ instance maybeDecode :: Decode a => Decode (Maybe a) where
 instance objectDecode :: Decode v => Decode (Object v) where
   decode = sequence <<< Object.mapWithKey (\_ -> decode) <=< readObject
 
+instance recordDecode :: (RowToList fields fieldList, DecodeForeignFields fieldList () fields) => Decode (Record fields) where
+  decode o = flip Builder.build {} <$> getFields (RLProxy :: RLProxy fieldList) o
+
+class DecodeForeignFields (xs :: RowList) (from :: # Type) (to :: # Type) | xs -> from to where
+  getFields :: RLProxy xs -> Foreign -> F (Builder (Record from) (Record to))
+
+instance decodeFieldsCons ::
+  ( IsSymbol name
+  , Decode a
+  , DecodeForeignFields tail from from'
+  , Row.Lacks name from'
+  , Row.Cons name a from' to
+  ) => DecodeForeignFields (Cons name a tail) from to where
+  getFields _ o = (compose <$> first) `exceptTApply` rest
+    where
+      first = do
+        value <- withExcept' (readProp name o >>= decode)
+        pure $ Builder.insert nameP value
+      rest = getFields tailP o
+      nameP = SProxy :: SProxy name
+      tailP = RLProxy :: RLProxy tail
+      name = reflectSymbol nameP
+      withExcept' = withExcept <<< map $ ErrorAtProperty name
+
+exceptTApply :: forall a b e m. Semigroup e => Applicative m => ExceptT e m (a -> b) -> ExceptT e m a -> ExceptT e m b
+exceptTApply f a = ExceptT $ applyEither <$> runExceptT f <*> runExceptT a
+
+applyEither :: forall e a b. Semigroup e => Either e (a -> b) -> Either e a -> Either e b
+applyEither (Left e) (Right _) = Left e
+applyEither (Left e1) (Left e2) = Left (e1 <> e2)
+applyEither (Right _) (Left e) = Left e
+applyEither (Right f) (Right a) = Right (f a)
+
+instance decodeFieldsNil :: DecodeForeignFields Nil () () where
+  getFields _ _ = pure identity
+
+
 -- | The `Encode` class is used to generate encoding functions
 -- | of the form `a -> Foreign` using `generics-rep` deriving.
 -- |
@@ -120,3 +165,27 @@ instance maybeEncode :: Encode a => Encode (Maybe a) where
 
 instance objectEncode :: Encode v => Encode (Object v) where
   encode = unsafeToForeign <<< Object.mapWithKey (\_ -> encode)
+
+instance recordEncode :: (RowToList fields fieldList, EncodeForeignFields fieldList fields () to) => Encode (Record fields) where
+  encode r = unsafeToForeign $ Builder.build (encodeFields (RLProxy :: RLProxy fieldList) r) {}
+
+class EncodeForeignFields (xs :: RowList) (row :: # Type) (from :: # Type) (to :: # Type) | xs -> row from to where
+  encodeFields :: forall g. g xs -> Record row -> Builder (Record from) (Record to)
+
+instance consEncodeForeignFields ::
+  ( IsSymbol name
+  , Encode a
+  , EncodeForeignFields tail row from from'
+  , Row.Cons name a whatever row
+  , Row.Lacks name from'
+  , Row.Cons name Foreign from' to
+  ) => EncodeForeignFields (Cons name a tail) row from to where
+  encodeFields _ r = Builder.insert nameP value <<< rest
+    where
+      nameP = SProxy :: SProxy name
+      value = encode (get nameP r)
+      tailP = RLProxy :: RLProxy tail
+      rest = encodeFields tailP r
+
+instance nilEncodeForeignFields :: EncodeForeignFields Nil row () () where
+  encodeFields _ _ = identity
