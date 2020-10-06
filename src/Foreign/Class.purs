@@ -137,7 +137,7 @@ instance voidEncode :: Encode Void where
   encode = absurd
 
 instance unitEncode :: Encode Unit where
-  encode _ = unsafeToForeign {}
+  encode _ = unsafeToForeign []
 
 instance foreignEncode :: Encode Foreign where
   encode = identity
